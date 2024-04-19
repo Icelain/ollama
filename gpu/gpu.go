@@ -20,6 +20,8 @@ import (
 	"strings"
 	"sync"
 	"unsafe"
+
+	"github.com/ollama/ollama/format"
 )
 
 type handles struct {
@@ -27,8 +29,12 @@ type handles struct {
 	cudart *C.cudart_handle_t
 }
 
+const (
+	cudaMinimumMemory = 457 * format.MebiByte
+	rocmMinimumMemory = 457 * format.MebiByte
+)
+
 var gpuMutex sync.Mutex
-var gpuHandles *handles = nil
 
 // With our current CUDA compile flags, older than 5.0 will not work properly
 var CudaComputeMin = [2]C.int{5, 0}
@@ -78,11 +84,11 @@ var CudartWindowsGlobs = []string{
 var CudaTegra string = os.Getenv("JETSON_JETPACK")
 
 // Note: gpuMutex must already be held
-func initGPUHandles() {
+func initGPUHandles() *handles {
 
 	// TODO - if the ollama build is CPU only, don't do these checks as they're irrelevant and confusing
 
-	gpuHandles = &handles{nil, nil}
+	gpuHandles := &handles{nil, nil}
 	var nvmlMgmtName string
 	var nvmlMgmtPatterns []string
 	var cudartMgmtName string
@@ -109,7 +115,7 @@ func initGPUHandles() {
 		}
 		cudartMgmtPatterns = append(cudartMgmtPatterns, CudartLinuxGlobs...)
 	default:
-		return
+		return gpuHandles
 	}
 
 	slog.Info("Detecting GPU type")
@@ -119,7 +125,7 @@ func initGPUHandles() {
 		if cudart != nil {
 			slog.Info("Nvidia GPU detected via cudart")
 			gpuHandles.cudart = cudart
-			return
+			return gpuHandles
 		}
 	}
 
@@ -130,10 +136,10 @@ func initGPUHandles() {
 		if nvml != nil {
 			slog.Info("Nvidia GPU detected via nvidia-ml")
 			gpuHandles.nvml = nvml
-			return
+			return gpuHandles
 		}
 	}
-
+	return gpuHandles
 }
 
 func GetGPUInfo() GpuInfo {
@@ -141,9 +147,16 @@ func GetGPUInfo() GpuInfo {
 	// GPUs so we can report warnings if we see Nvidia/AMD but fail to load the libraries
 	gpuMutex.Lock()
 	defer gpuMutex.Unlock()
-	if gpuHandles == nil {
-		initGPUHandles()
-	}
+
+	gpuHandles := initGPUHandles()
+	defer func() {
+		if gpuHandles.nvml != nil {
+			C.nvml_release(*gpuHandles.nvml)
+		}
+		if gpuHandles.cudart != nil {
+			C.cudart_release(*gpuHandles.cudart)
+		}
+	}()
 
 	// All our GPU builds on x86 have AVX enabled, so fallback to CPU if we don't detect at least AVX
 	cpuVariant := GetCPUVariant()
@@ -168,6 +181,7 @@ func GetGPUInfo() GpuInfo {
 			} else if cc.major > CudaComputeMin[0] || (cc.major == CudaComputeMin[0] && cc.minor >= CudaComputeMin[1]) {
 				slog.Info(fmt.Sprintf("[nvidia-ml] NVML CUDA Compute Capability detected: %d.%d", cc.major, cc.minor))
 				resp.Library = "cuda"
+				resp.MinimumMemory = cudaMinimumMemory
 			} else {
 				slog.Info(fmt.Sprintf("[nvidia-ml] CUDA GPU is too old. Falling back to CPU mode. Compute Capability detected: %d.%d", cc.major, cc.minor))
 			}
@@ -187,6 +201,7 @@ func GetGPUInfo() GpuInfo {
 			} else if cc.major > CudaComputeMin[0] || (cc.major == CudaComputeMin[0] && cc.minor >= CudaComputeMin[1]) {
 				slog.Info(fmt.Sprintf("[cudart] CUDART CUDA Compute Capability detected: %d.%d", cc.major, cc.minor))
 				resp.Library = "cuda"
+				resp.MinimumMemory = cudaMinimumMemory
 			} else {
 				slog.Info(fmt.Sprintf("[cudart] CUDA GPU is too old. Falling back to CPU mode. Compute Capability detected: %d.%d", cc.major, cc.minor))
 			}
@@ -194,6 +209,7 @@ func GetGPUInfo() GpuInfo {
 	} else {
 		AMDGetGPUInfo(&resp)
 		if resp.Library != "" {
+			resp.MinimumMemory = rocmMinimumMemory
 			return resp
 		}
 	}
@@ -227,7 +243,7 @@ func getCPUMem() (memInfo, error) {
 	return ret, nil
 }
 
-func CheckVRAM() (int64, error) {
+func CheckVRAM() (uint64, error) {
 	userLimit := os.Getenv("OLLAMA_MAX_VRAM")
 	if userLimit != "" {
 		avail, err := strconv.ParseInt(userLimit, 10, 64)
@@ -235,24 +251,11 @@ func CheckVRAM() (int64, error) {
 			return 0, fmt.Errorf("Invalid OLLAMA_MAX_VRAM setting %s: %s", userLimit, err)
 		}
 		slog.Info(fmt.Sprintf("user override OLLAMA_MAX_VRAM=%d", avail))
-		return avail, nil
+		return uint64(avail), nil
 	}
 	gpuInfo := GetGPUInfo()
 	if gpuInfo.FreeMemory > 0 && (gpuInfo.Library == "cuda" || gpuInfo.Library == "rocm") {
-		// leave 10% or 1024MiB of VRAM free per GPU to handle unaccounted for overhead
-		overhead := gpuInfo.FreeMemory / 10
-		gpus := uint64(gpuInfo.DeviceCount)
-		if overhead < gpus*1024*1024*1024 {
-			overhead = gpus * 1024 * 1024 * 1024
-		}
-		// Assigning full reported free memory for Tegras due to OS controlled caching.
-		if CudaTegra != "" {
-			// Setting overhead for non-Tegra devices
-			overhead = 0
-		}
-		avail := int64(gpuInfo.FreeMemory - overhead)
-		slog.Debug(fmt.Sprintf("%s detected %d devices with %dM available memory", gpuInfo.Library, gpuInfo.DeviceCount, avail/1024/1024))
-		return avail, nil
+		return gpuInfo.FreeMemory, nil
 	}
 
 	return 0, fmt.Errorf("no GPU detected") // TODO - better handling of CPU based memory determiniation
