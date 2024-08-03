@@ -217,12 +217,12 @@ func (s *Scheduler) processPending(ctx context.Context) {
 					} else if loadedCount == 0 {
 						// No models loaded. Load the model but prefer the best fit.
 						slog.Debug("loading first model", "model", pending.model.ModelPath)
-						g := pickBestFullFitByLibrary(pending, ggml, gpus, &numParallel)
+						g, numParallel := pickBestFullFitByLibrary(pending, ggml, gpus, numParallel)
 						if g != nil {
 							gpus = g
 						} else {
 							// Only allow partial loads when this is the first model
-							gpus = pickBestPartialFitByLibrary(pending, ggml, gpus, &numParallel)
+							gpus, numParallel = pickBestPartialFitByLibrary(pending, ggml, gpus, numParallel)
 						}
 						s.loadFn(pending, ggml, gpus, numParallel)
 						break
@@ -239,7 +239,7 @@ func (s *Scheduler) processPending(ctx context.Context) {
 
 						// Update free memory from currently loaded models
 						s.updateFreeSpace(availGpus)
-						fitGpus := pickBestFullFitByLibrary(pending, ggml, availGpus, &numParallel)
+						fitGpus, numParallel := pickBestFullFitByLibrary(pending, ggml, availGpus, numParallel)
 						if fitGpus != nil {
 							slog.Debug("new model fits with existing models, loading")
 							s.loadFn(pending, ggml, fitGpus, numParallel)
@@ -681,15 +681,15 @@ func (a ByDuration) Less(i, j int) bool {
 // If the model can not be fit fully within the available GPU(s) nil is returned
 // If numParallel is <= 0, this will attempt try to optimize parallism based on available VRAM, and adjust
 // opts.NumCtx accordingly
-func pickBestFullFitByLibrary(req *LlmRequest, ggml *llm.GGML, gpus gpu.GpuInfoList, numParallel *int) gpu.GpuInfoList {
+func pickBestFullFitByLibrary(req *LlmRequest, ggml *llm.GGML, gpus gpu.GpuInfoList, numParallel int) (gpu.GpuInfoList, int) {
 	var estimatedVRAM uint64
 
 	var numParallelToTry []int
-	if *numParallel <= 0 {
+	if numParallel <= 0 {
 		// If no specific parallel setting was provided, try larger then smaller, always end with 1
 		numParallelToTry = append(numParallelToTry, defaultParallel, 1)
 	} else {
-		numParallelToTry = []int{*numParallel}
+		numParallelToTry = []int{numParallel}
 	}
 
 	for _, gl := range gpus.ByLibrary() {
@@ -708,8 +708,8 @@ func pickBestFullFitByLibrary(req *LlmRequest, ggml *llm.GGML, gpus gpu.GpuInfoL
 				for _, g := range sgl {
 					if ok, estimatedVRAM = llm.PredictServerFit([]gpu.GpuInfo{g}, ggml, req.model.AdapterPaths, req.model.ProjectorPaths, req.opts); ok {
 						slog.Info("new model will fit in available VRAM in single GPU, loading", "model", req.model.ModelPath, "gpu", g.ID, "parallel", p, "available", g.FreeMemory, "required", format.HumanBytes2(estimatedVRAM))
-						*numParallel = p
-						return []gpu.GpuInfo{g}
+						numParallel = p
+						return []gpu.GpuInfo{g}, numParallel
 					}
 				}
 			}
@@ -724,20 +724,20 @@ func pickBestFullFitByLibrary(req *LlmRequest, ggml *llm.GGML, gpus gpu.GpuInfoL
 			req.opts.NumCtx = req.origNumCtx * p
 			if ok, estimatedVRAM = llm.PredictServerFit(sgl, ggml, req.model.AdapterPaths, req.model.ProjectorPaths, req.opts); ok {
 				slog.Info("new model will fit in available VRAM, loading", "model", req.model.ModelPath, "library", sgl[0].Library, "parallel", p, "required", format.HumanBytes2(estimatedVRAM))
-				*numParallel = p
-				return sgl
+				numParallel = p
+				return sgl, numParallel
 			}
 		}
 	}
-	return nil
+	return nil, numParallel
 }
 
 // If multiple Libraries are detected, pick the Library which loads the most layers for the model
-func pickBestPartialFitByLibrary(req *LlmRequest, ggml *llm.GGML, gpus gpu.GpuInfoList, numParallel *int) gpu.GpuInfoList {
-	*numParallel = 1
+func pickBestPartialFitByLibrary(req *LlmRequest, ggml *llm.GGML, gpus gpu.GpuInfoList, numParallel int) (gpu.GpuInfoList, int) {
+	numParallel = 1
 	byLibrary := gpus.ByLibrary()
 	if len(byLibrary) <= 1 {
-		return gpus
+		return gpus, numParallel
 	}
 	var bestEstimate uint64
 	var bestFit int
@@ -748,7 +748,7 @@ func pickBestPartialFitByLibrary(req *LlmRequest, ggml *llm.GGML, gpus gpu.GpuIn
 			bestFit = i
 		}
 	}
-	return byLibrary[bestFit]
+	return byLibrary[bestFit], numParallel
 }
 
 // findRunnerToUnload finds a runner to unload to make room for a new model
